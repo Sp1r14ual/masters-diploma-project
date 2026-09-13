@@ -2,27 +2,120 @@ import re
 import sqlite3
 import os
 import streamlit as st
-from llama_cpp import Llama
 from table_retriever import TableRetriever
 from reranker import get_reranker
 from retriever import FaissRetriever, extract_section_fragment
 
 
+class LLMClient:
+    """Универсальный клиент для взаимодействия с LLM:
+    1) HTTP llama-server (OpenAI-compatible /v1/completions или /completion)
+    2) HTTP Ollama (/api/generate)
+    3) Локальный llama-cpp-python (если библиотека установлена)
+    4) Безопасная заглушка (если сервер ещё не запущен, чтобы интерфейс не падал)."""
+
+    def __init__(self, base_url: str = "http://127.0.0.1:8080", gguf_path: str | None = None):
+        self.base_url = os.getenv("LLM_BASE_URL", base_url).rstrip("/")
+        self.gguf_path = gguf_path
+        self._llama_instance = None
+
+        if self.gguf_path and os.path.exists(self.gguf_path):
+            try:
+                from llama_cpp import Llama
+                self._llama_instance = Llama(
+                    model_path=self.gguf_path,
+                    n_gpu_layers=int(os.getenv("LLM_GPU_LAYERS", "10")),
+                    n_ctx=int(os.getenv("LLM_CTX", "8192")),
+                    n_threads=int(os.getenv("LLM_THREADS", "6")),
+                    n_batch=512,
+                    flash_attn=True,
+                    verbose=False,
+                )
+            except Exception:
+                self._llama_instance = None
+
+    def __call__(self, prompt: str, max_tokens: int = 2048, temperature: float = 0.1, repeat_penalty: float = 1.1) -> dict:
+        # 1. Попытка через локальный инстанс llama_cpp, если он загружен
+        if self._llama_instance is not None:
+            try:
+                return self._llama_instance(
+                    prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    repeat_penalty=repeat_penalty,
+                )
+            except Exception as e:
+                print(f"Ошибка локального инференса llama_cpp: {e}")
+
+        # 2. Обращение к HTTP llama-server (порт 8080)
+        import requests
+        payload = {
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "repeat_penalty": repeat_penalty,
+        }
+
+        try:
+            resp = requests.post(f"{self.base_url}/v1/completions", json=payload, timeout=180)
+            if resp.status_code == 200:
+                data = resp.json()
+                if "choices" in data and len(data["choices"]) > 0:
+                    return data
+        except requests.exceptions.RequestException:
+            pass
+
+        try:
+            resp = requests.post(f"{self.base_url}/completion", json=payload, timeout=180)
+            if resp.status_code == 200:
+                data = resp.json()
+                text = data.get("content", "")
+                return {"choices": [{"text": text}]}
+        except requests.exceptions.RequestException:
+            pass
+
+        # 3. Обращение к Ollama (порт 11434)
+        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+        try:
+            ollama_payload = {
+                "model": os.getenv("OLLAMA_MODEL", "qwen2.5:14b"),
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": temperature,
+                    "num_predict": max_tokens,
+                },
+            }
+            resp = requests.post(f"{ollama_url}/api/generate", json=ollama_payload, timeout=180)
+            if resp.status_code == 200:
+                text = resp.json().get("response", "")
+                return {"choices": [{"text": text}]}
+        except requests.exceptions.RequestException:
+            pass
+
+        # 4. Сообщение пользователю, если сервер модели ещё не запущен
+        return {
+            "choices": [{
+                "text": (
+                    "###ОТВЕТ###\n"
+                    "⚠️ **Сервер языковой модели не отвечает.**\n\n"
+                    f"Сервис попытался подключиться к `{self.base_url}` и `{ollama_url}`, но соединение не установлено.\n\n"
+                    "**Как включить генерацию ответов:**\n"
+                    "1. Запустите локальный сервер `run_llama_server.bat` (он запустит модель Qwen на порту 8080).\n"
+                    "2. Либо запустите Ollama (`ollama run qwen2.5:14b`).\n\n"
+                    "*Примечание: Загрузка документов, парсинг Docling и семантический поиск по таблицам и чанкам работают независимо от сервера LLM.*"
+                )
+            }]
+        }
+
+
 @st.cache_resource
-def load_llm() -> Llama:
-    """Загружает языковую модель Qwen из файла .gguf и кэширует её на весь сеанс.
-    Путь к модели определяется относительно расположения текущего файла."""
+def load_llm() -> LLMClient:
+    """Загружает или подключает языковую модель Qwen и кэширует клиент на весь сеанс."""
     base = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(base, "models", "Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf")
-    return Llama(
-        model_path=path,
-        n_gpu_layers=28,
-        n_ctx=32768,
-        n_threads=6,
-        n_batch=512,
-        flash_attn=True,
-        verbose=False,
-    )
+    server_url = os.getenv("LLM_BASE_URL", "http://127.0.0.1:8080")
+    return LLMClient(base_url=server_url, gguf_path=path)
 
 
 @st.cache_resource

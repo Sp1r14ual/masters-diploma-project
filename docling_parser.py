@@ -2,7 +2,10 @@ import os
 import re
 import sqlite3
 
-import fitz  # PyMuPDF
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz  # PyMuPDF
 from docling.document_converter import DocumentConverter
 from embedding_manager import create_embedding
 

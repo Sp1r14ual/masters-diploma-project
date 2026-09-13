@@ -1,13 +1,19 @@
 # Основной интерфейс
-streamlit
+streamlit>=1.35.0
 
 # Работа с базой данных и данными
-pandas
-# sqlite3
+pandas>=2.0.0
 
 # Обработка документов и PDF
-docling
-PyMuPDF
+docling>=2.0.0
+PyMuPDF>=1.24.0
+
+# Эмбеддинги, векторный поиск и реранкинг
+sentence-transformers>=3.0.0
+faiss-cpu>=1.8.0
+torch>=2.2.0
+transformers>=4.40.0
+scikit-learn>=1.4.0
 
 # Работа с API и сетью
-requests
+requests>=2.31.0

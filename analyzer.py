@@ -1,10 +1,19 @@
 import re
 import sqlite3
 import os
+import requests
 import streamlit as st
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from table_retriever import TableRetriever
 from reranker import get_reranker
 from retriever import FaissRetriever, extract_section_fragment
+
 
 
 class LLMClient:
@@ -140,6 +149,96 @@ def load_llm() -> LLMClient:
 
     server_url = os.getenv("LLM_BASE_URL", "http://127.0.0.1:8080")
     return LLMClient(base_url=server_url, gguf_path=model_path)
+
+
+class GeminiClient:
+    """Клиент для взаимодействия с Google Gemini API через REST (requests).
+    Полностью совместим с интерфейсом LLMClient:
+    вызов client(prompt, max_tokens, temperature) возвращает {'choices': [{'text': ...}]}
+    """
+
+    def __init__(self, api_key: str | None = None, model: str = "gemini-2.5-flash", base_url: str | None = None):
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        self.base_url = (base_url or os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com")).rstrip("/")
+
+    def __call__(self, prompt: str, max_tokens: int = 2048, temperature: float = 0.1, repeat_penalty: float = 1.1) -> dict:
+        key = (self.api_key or os.getenv("GEMINI_API_KEY", "")).strip()
+        if not key:
+            return {
+                "choices": [{
+                    "text": (
+                        "⚠️ **API-ключ Google Gemini не указан.**\n\n"
+                        "Пожалуйста, введите ваш API-ключ в боковой панели Streamlit "
+                        "или сохраните его в файле `.env` в корне проекта (`GEMINI_API_KEY=AIzaSy...`)."
+                    )
+                }]
+            }
+
+        url = f"{self.base_url}/v1beta/models/{self.model}:generateContent?key={key}"
+        payload = {
+            "contents": [
+                {
+                    "parts": [{"text": prompt}]
+                }
+            ],
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+            }
+        }
+
+        proxies = {}
+        proxy = os.getenv("GEMINI_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+        if proxy:
+            proxies = {"http": proxy, "https": proxy}
+
+        try:
+            resp = requests.post(url, json=payload, timeout=60, proxies=proxies if proxies else None)
+            if resp.status_code == 200:
+                data = resp.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    text = "".join(p.get("text", "") for p in parts)
+                    return {"choices": [{"text": text}]}
+                return {"choices": [{"text": "Модель Gemini вернула пустой ответ."}]}
+
+            err_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            err_msg = err_data.get("error", {}).get("message", resp.text)
+            print(f"[GeminiClient] HTTP {resp.status_code}: {err_msg}")
+
+            if "API_KEY_INVALID" in err_msg or (resp.status_code == 400 and "API key" in err_msg):
+                msg = f"❌ **Недействительный ключ Gemini API:** {err_msg}\n\nПроверьте правильность ключа в Google AI Studio."
+            elif "User location is not supported" in err_msg:
+                msg = (
+                    "⚠️ **Геолокация не поддерживается Google Gemini без VPN/прокси.**\n\n"
+                    "Прямой доступ к API Google ограничен из вашего текущего региона.\n\n"
+                    "**Как решить:**\n"
+                    "1. Включите VPN в системе;\n"
+                    "2. Либо укажите локальный прокси в файле `.env` (`GEMINI_PROXY=http://127.0.0.1:10808`);\n"
+                    "3. Либо переключитесь на `Локальный Qwen (llama-server)` в боковой панели."
+                )
+            elif resp.status_code == 429:
+                msg = "⚠️ **Превышена квота запросов (Rate Limit) к Gemini API.** Подождите минуту и повторите запрос."
+            elif resp.status_code == 404:
+                msg = f"❌ **Модель `{self.model}` не найдена.** Попробуйте выбрать `gemini-1.5-flash` в настройках боковой панели."
+            else:
+                msg = f"❌ **Ошибка Gemini API (HTTP {resp.status_code}):** {err_msg}"
+
+            return {"choices": [{"text": msg}]}
+
+        except requests.exceptions.Timeout:
+            return {"choices": [{"text": "⏱️ **Таймаут соединения с Gemini API (60 секунд).** Проверьте интернет-соединение или VPN."}]}
+        except requests.exceptions.RequestException as e:
+            return {"choices": [{"text": f"🌐 **Сетевая ошибка при обращении к Gemini API:** {e}\n\nЕсли вы находитесь в регионе с ограничениями, может потребоваться VPN или прокси."}]}
+
+
+@st.cache_resource
+def load_gemini_llm(api_key: str | None = None, model: str = "gemini-2.5-flash") -> GeminiClient:
+    """Создаёт и кэширует экземпляр GeminiClient для работы с Google Gemini API."""
+    return GeminiClient(api_key=api_key, model=model)
+
 
 
 @st.cache_resource
@@ -538,3 +637,7 @@ def get_analysis_from_qwen(llm, report_ids, user_query):
     raw_answer = re.sub(r"###\s*[ОO][ТT]?[ВB]?[ЕE]?[ТT]?\s*[:#]*", "", raw_answer, flags=re.IGNORECASE)
 
     return raw_answer.strip()
+
+
+# Универсальный алиас для вызова анализа
+get_analysis = get_analysis_from_qwen

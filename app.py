@@ -1,12 +1,19 @@
+import os
 import streamlit as st
 import sqlite3
 import pandas as pd
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from docling_parser import process_document
-from analyzer import get_analysis_from_qwen, load_llm
+from analyzer import get_analysis_from_qwen, load_llm, load_gemini_llm
 
 st.set_page_config(page_title="Система анализа документов", layout="wide")
 
-llm = load_llm()
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -108,6 +115,61 @@ with st.sidebar:
         st.info("База данных пуста. Загрузите первый документ.")
 
     st.divider()
+    st.header("🧠 Языковая модель")
+
+    env_gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    provider_options = ["Облачные модели", "Локальные модели"]
+    has_key = bool(env_gemini_key or st.session_state.get("gemini_api_key"))
+    default_provider_idx = 0 if has_key else 1
+
+    selected_provider = st.radio(
+        "Выберите режим работы:",
+        provider_options,
+        index=default_provider_idx,
+        help="«Облачные модели» работают через интернет без нагрузки на ваш ПК. «Локальные модели» работают автономно на вашей видеокарте и процессоре.",
+    )
+
+    if selected_provider == "Облачные модели":
+        cloud_service = st.selectbox(
+            "Сервис:",
+            ["Google Gemini API"],
+            index=0,
+        )
+
+        gemini_key = st.text_input(
+            "Gemini API-ключ:",
+            value=st.session_state.get("gemini_api_key", env_gemini_key),
+            type="password",
+            placeholder="Вставьте ваш API-ключ...",
+            help="Получите бесплатный ключ в Google AI Studio: https://aistudio.google.com/app/apikey. Ключ сохраняется в сессии или считывается из .env.",
+        )
+        if gemini_key:
+            st.session_state.gemini_api_key = gemini_key
+
+        models_list = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
+        env_model = os.getenv("GEMINI_MODEL", "").strip()
+        if env_model and env_model not in models_list:
+            models_list.append(env_model)
+
+        model_name = st.selectbox(
+            "Модель:",
+            models_list,
+            index=0,
+            help="gemini-2.5-flash — самая современная и быстрая модель. gemini-1.5-flash — стабильный легковесный вариант.",
+        )
+        llm = load_gemini_llm(api_key=gemini_key, model=model_name)
+        active_model_badge = f"⚡ Gemini ({model_name})"
+
+        if gemini_key:
+            st.caption("✅ Ключ указан и активен")
+        else:
+            st.warning("⚠️ Введите API-ключ для отправки запросов")
+    else:
+        llm = load_llm()
+        active_model_badge = "🖥️ Локальный Qwen (llama-server)"
+        st.caption("Сервер: `http://127.0.0.1:8080` (Qwen2.5-7B / 3B)")
+
+    st.divider()
     with st.expander("💡 Типы запросов"):
         st.markdown("""
 | Тип | Пример запроса |
@@ -123,6 +185,7 @@ with st.sidebar:
 # ── Главная область: чат ──────────────────────────────────────────────────────
 
 st.title("📊 Система анализа документов")
+st.caption(f"Активная модель: **{active_model_badge}**")
 
 if not active_ids:
     st.warning("👈 Выберите один или несколько документов в боковой панели.")
@@ -156,7 +219,7 @@ if user_query:
         st.markdown(user_query)
 
     with st.chat_message("assistant"):
-        with st.spinner("Модель анализирует документы…"):
+        with st.spinner(f"Модель ({active_model_badge}) анализирует документы…"):
             answer = get_analysis_from_qwen(llm, active_ids, user_query)
         st.markdown(answer)
 

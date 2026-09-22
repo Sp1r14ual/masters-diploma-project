@@ -57,22 +57,26 @@ class LLMClient:
         }
 
         try:
-            resp = requests.post(f"{self.base_url}/v1/completions", json=payload, timeout=180)
+            resp = requests.post(f"{self.base_url}/v1/completions", json=payload, timeout=240)
             if resp.status_code == 200:
                 data = resp.json()
                 if "choices" in data and len(data["choices"]) > 0:
                     return data
-        except requests.exceptions.RequestException:
-            pass
+            else:
+                print(f"[LLMClient] /v1/completions HTTP {resp.status_code}: {resp.text[:200]}")
+        except requests.exceptions.RequestException as e:
+            print(f"[LLMClient] /v1/completions error: {e}")
 
         try:
-            resp = requests.post(f"{self.base_url}/completion", json=payload, timeout=180)
+            resp = requests.post(f"{self.base_url}/completion", json=payload, timeout=240)
             if resp.status_code == 200:
                 data = resp.json()
                 text = data.get("content", "")
                 return {"choices": [{"text": text}]}
-        except requests.exceptions.RequestException:
-            pass
+            else:
+                print(f"[LLMClient] /completion HTTP {resp.status_code}: {resp.text[:200]}")
+        except requests.exceptions.RequestException as e:
+            print(f"[LLMClient] /completion error: {e}")
 
         # 3. Обращение к Ollama (порт 11434)
         ollama_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
@@ -117,9 +121,9 @@ def load_llm() -> LLMClient:
     
     # Автоматический поиск подходящей модели
     preferred_models = [
+        "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
         "Qwen2.5-3B-Instruct-Q5_K_M.gguf",
-        # "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
-        # "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+        "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
     ]
     model_path = None
     for name in preferred_models:
@@ -168,16 +172,41 @@ GENERAL - остальное
 Ответ:
 """
 
-_SYSTEM_PROMPT = """Ты аналитик университета. Отвечай ТОЛЬКО на основе предоставленного контекста.
+_INTENT_INSTRUCTIONS = {
+    "SEARCH": (
+        "- Найди точное значение в переданном контексте.\n"
+        "- Обязательно сопоставляй точный столбец (год, форму обучения, категорию) с нужной строкой.\n"
+        "- Укажи таблицу или раздел и точное значение."
+    ),
+    "CALCULATE": (
+        "- Для вычислений: сначала выпиши точные исходные числа из таблицы/текста с указанием строки и столбца.\n"
+        "- Покажи пошаговый расчет с формулой (например: 274.0 + 308.0 = 582.0).\n"
+        "- Дай четкий итоговый результат."
+    ),
+    "ANOMALIES": (
+        "- Внимательно проверь таблицы на предмет математических ошибок и нестыковок.\n"
+        "- Пересчитай суммы по строкам и столбцам: сложи отдельные слагаемые и сравни их фактическую сумму со значением в строке 'Итого' / 'Всего'.\n"
+        "- Если сумма слагаемых не сходится со значением в 'Итого' / 'Всего', обязательно укажи: в какой таблице ошибка, какие числа складывались, сколько должно получиться на самом деле и какое ошибочное число впечатано в отчет."
+    ),
+    "ANALYZE": (
+        "- Проведи сравнительный анализ показателей, выдели ключевые изменения и тенденции.\n"
+        "- Приведи динамику изменений как в абсолютных значениях, так и в процентах (прирост/спад)."
+    ),
+    "STRUCTURE": (
+        "- Приведи структурированный перечень всех разделов и таблиц, найденных в контексте документа."
+    ),
+    "GENERAL": (
+        "- Ответь четко и по существу на основе информации из переданного контекста."
+    ),
+}
+
+_SYSTEM_PROMPT = """Ты аналитик университетской отчетности. Твоя задача — дать точный, логически обоснованный и проверяемый ответ по предоставленному контексту.
 
 Строгие правила:
-- Используй исключительно информацию из раздела «Контекст» ниже.
-- Если ответ на вопрос не содержится в контексте — прямо сообщи об этом.
-- Не добавляй факты, данные или рассуждения из общих знаний.
-- Не придумывай цифры, названия и даты.
-- Когда готов дать финальный ответ, напиши маркер ###ОТВЕТ### и после него — сам ответ.
-
-Тип запроса: {intent}
+1. Используй ИСКЛЮЧИТЕЛЬНО информацию из раздела «Контекст» ниже.
+2. Не добавляй факты, догадки или цифры от себя. Если данных в контексте недостаточно — прямо сообщи об этом.
+3. Соблюдай специальные требования для текущей задачи ({intent}):
+{intent_instruction}
 
 Контекст:
 {context}
@@ -185,7 +214,7 @@ _SYSTEM_PROMPT = """Ты аналитик университета. Отвеча
 Вопрос:
 {query}
 
-###ОТВЕТ###"""
+Ответ аналитика:"""
 
 
 def rerank_results(query, results, top_k=100):
@@ -298,9 +327,9 @@ def build_structure_context(report_name, chunks):
 
 def faiss_results_to_context(report_name, results):
     """Формирует единую строку контекста из списка найденных чанков.
-    Ограничивает суммарный объём контекста 60 000 символами, чтобы не превысить
-    контекстное окно модели."""
-    MAX_CONTEXT_CHARS = 60_000
+    Ограничивает суммарный объём контекста 12 000 символами (~2500 токенов),
+    чтобы не перегружать контекстное окно и KV-кэш модели."""
+    MAX_CONTEXT_CHARS = 12_000
     parts = []
     total_size = 0
 
@@ -424,7 +453,9 @@ def _collect_context_for_report(report_id, user_query, intent, cursor):
             results,
             key_fn=lambda r: str(r["chunk_order"]) + r["chunk_text"][:500],
         )
-        results = rerank_results(user_query, results, top_k=100)
+        # Отбираем наиболее релевантные чанки (топ-3 для точечных, топ-5 для общих)
+        top_k_rerank = 5 if intent in ("ANALYZE", "ANOMALIES", "STRUCTURE") else 3
+        results = rerank_results(user_query, results, top_k=top_k_rerank)
 
         print("\nRERANK RESULTS")
         for r in results:
@@ -475,8 +506,10 @@ def get_analysis_from_qwen(llm, report_ids, user_query):
     if not full_context.strip():
         return "По выбранным документам релевантная информация не найдена."
 
+    intent_instruction = _INTENT_INSTRUCTIONS.get(intent, _INTENT_INSTRUCTIONS["GENERAL"])
     prompt = _SYSTEM_PROMPT.format(
         intent=intent,
+        intent_instruction=intent_instruction,
         context=full_context,
         query=user_query,
     )

@@ -217,5 +217,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# GGUF Models
+# Project files
 models/*
+*.pdf

@@ -140,7 +140,7 @@ pip install -r requirements.txt
 
 ```
 models/
-└── Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf
+└── Qwen2.5-7B-Instruct-Q4_K_M.gguf
 ```
 
 Путь к модели задаётся в `analyzer.py`.

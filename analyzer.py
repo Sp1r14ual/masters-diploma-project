@@ -113,9 +113,29 @@ class LLMClient:
 def load_llm() -> LLMClient:
     """Загружает или подключает языковую модель Qwen и кэширует клиент на весь сеанс."""
     base = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(base, "models", "Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf")
+    models_dir = os.path.join(base, "models")
+    
+    # Автоматический поиск подходящей модели
+    preferred_models = [
+        "Qwen2.5-3B-Instruct-Q5_K_M.gguf",
+        "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+        "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+    ]
+    model_path = None
+    for name in preferred_models:
+        candidate = os.path.join(models_dir, name)
+        if os.path.exists(candidate):
+            model_path = candidate
+            break
+            
+    if model_path is None and os.path.exists(models_dir):
+        for f in os.listdir(models_dir):
+            if f.endswith(".gguf"):
+                model_path = os.path.join(models_dir, f)
+                break
+
     server_url = os.getenv("LLM_BASE_URL", "http://127.0.0.1:8080")
-    return LLMClient(base_url=server_url, gguf_path=path)
+    return LLMClient(base_url=server_url, gguf_path=model_path)
 
 
 @st.cache_resource

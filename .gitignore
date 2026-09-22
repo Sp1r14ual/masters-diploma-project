@@ -219,4 +219,5 @@ __marimo__/
 
 # Project files
 models/*
+*.db
 *.pdf

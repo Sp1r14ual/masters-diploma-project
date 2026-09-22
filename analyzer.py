@@ -1,10 +1,19 @@
 import re
 import sqlite3
 import os
+import requests
 import streamlit as st
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from table_retriever import TableRetriever
 from reranker import get_reranker
 from retriever import FaissRetriever, extract_section_fragment
+
 
 
 class LLMClient:
@@ -14,9 +23,10 @@ class LLMClient:
     3) Локальный llama-cpp-python (если библиотека установлена)
     4) Безопасная заглушка (если сервер ещё не запущен, чтобы интерфейс не падал)."""
 
-    def __init__(self, base_url: str = "http://127.0.0.1:8080", gguf_path: str | None = None):
+    def __init__(self, base_url: str = "http://127.0.0.1:8080", gguf_path: str | None = None, model_name: str | None = None):
         self.base_url = os.getenv("LLM_BASE_URL", base_url).rstrip("/")
         self.gguf_path = gguf_path
+        self.model_name = model_name or (os.path.basename(gguf_path) if gguf_path else "Локальная модель")
         self._llama_instance = None
 
         if self.gguf_path and os.path.exists(self.gguf_path):
@@ -24,7 +34,7 @@ class LLMClient:
                 from llama_cpp import Llama
                 self._llama_instance = Llama(
                     model_path=self.gguf_path,
-                    n_gpu_layers=int(os.getenv("LLM_GPU_LAYERS", "10")),
+                    n_gpu_layers=int(os.getenv("LLM_GPU_LAYERS", "18")),
                     n_ctx=int(os.getenv("LLM_CTX", "8192")),
                     n_threads=int(os.getenv("LLM_THREADS", "6")),
                     n_batch=512,
@@ -33,6 +43,32 @@ class LLMClient:
                 )
             except Exception:
                 self._llama_instance = None
+
+    def get_server_info(self) -> dict:
+        """Проверяет доступность сервера llama-server и определяет имя запущенной модели."""
+        try:
+            resp = requests.get(f"{self.base_url}/props", timeout=1.5)
+            if resp.status_code == 200:
+                data = resp.json()
+                raw_path = data.get("model_path", "")
+                name = os.path.basename(raw_path.replace("\\", "/")) if raw_path else "Online"
+                return {"online": True, "model": name}
+        except Exception:
+            pass
+
+        try:
+            resp = requests.get(f"{self.base_url}/v1/models", timeout=1.5)
+            if resp.status_code == 200:
+                data = resp.json()
+                models_data = data.get("data", [])
+                if models_data:
+                    raw_id = models_data[0].get("id", "")
+                    name = os.path.basename(raw_id.replace("\\", "/")) if raw_id else "Online"
+                    return {"online": True, "model": name}
+        except Exception:
+            pass
+
+        return {"online": False, "model": None}
 
     def __call__(self, prompt: str, max_tokens: int = 2048, temperature: float = 0.1, repeat_penalty: float = 1.1) -> dict:
         # 1. Попытка через локальный инстанс llama_cpp, если он загружен
@@ -57,22 +93,26 @@ class LLMClient:
         }
 
         try:
-            resp = requests.post(f"{self.base_url}/v1/completions", json=payload, timeout=180)
+            resp = requests.post(f"{self.base_url}/v1/completions", json=payload, timeout=240)
             if resp.status_code == 200:
                 data = resp.json()
                 if "choices" in data and len(data["choices"]) > 0:
                     return data
-        except requests.exceptions.RequestException:
-            pass
+            else:
+                print(f"[LLMClient] /v1/completions HTTP {resp.status_code}: {resp.text[:200]}")
+        except requests.exceptions.RequestException as e:
+            print(f"[LLMClient] /v1/completions error: {e}")
 
         try:
-            resp = requests.post(f"{self.base_url}/completion", json=payload, timeout=180)
+            resp = requests.post(f"{self.base_url}/completion", json=payload, timeout=240)
             if resp.status_code == 200:
                 data = resp.json()
                 text = data.get("content", "")
                 return {"choices": [{"text": text}]}
-        except requests.exceptions.RequestException:
-            pass
+            else:
+                print(f"[LLMClient] /completion HTTP {resp.status_code}: {resp.text[:200]}")
+        except requests.exceptions.RequestException as e:
+            print(f"[LLMClient] /completion error: {e}")
 
         # 3. Обращение к Ollama (порт 11434)
         ollama_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
@@ -109,33 +149,175 @@ class LLMClient:
         }
 
 
-@st.cache_resource
-def load_llm() -> LLMClient:
-    """Загружает или подключает языковую модель Qwen и кэширует клиент на весь сеанс."""
+def get_available_local_models() -> list[str]:
+    """Возвращает список доступных .gguf моделей из папки models/,
+    отсортированных по приоритету."""
     base = os.path.dirname(os.path.abspath(__file__))
     models_dir = os.path.join(base, "models")
-    
-    # Автоматический поиск подходящей модели
-    preferred_models = [
+    if not os.path.exists(models_dir):
+        return []
+
+    priority = [
+        "YandexGPT-5-Lite-8B-instruct-Q4_K_M.gguf",
+        "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
         "Qwen2.5-3B-Instruct-Q5_K_M.gguf",
         "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
-        "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
     ]
+    files = [f for f in os.listdir(models_dir) if f.endswith(".gguf")]
+
+    def sort_key(name):
+        return (priority.index(name) if name in priority else 999, name)
+
+    files.sort(key=sort_key)
+    return files
+
+
+def set_env_local_model(model_filename: str):
+    """Сохраняет выбранную локальную модель в файл .env для скрипта запуска."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(base, ".env")
+    lines = []
+    found = False
+    new_line = f"LOCAL_MODEL=models\\{model_filename}\n"
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        for i, line in enumerate(lines):
+            if line.strip().startswith("LOCAL_MODEL="):
+                lines[i] = new_line
+                found = True
+                break
+    if not found:
+        lines.append(new_line)
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+@st.cache_resource
+def load_llm(model_name: str | None = None) -> LLMClient:
+    """Загружает или подключает локальную языковую модель (YandexGPT / Qwen) и кэширует клиент."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    models_dir = os.path.join(base, "models")
+
     model_path = None
-    for name in preferred_models:
-        candidate = os.path.join(models_dir, name)
+    if model_name:
+        candidate = os.path.join(models_dir, model_name)
         if os.path.exists(candidate):
             model_path = candidate
-            break
-            
+
+    if model_path is None:
+        preferred_models = [
+            "YandexGPT-5-Lite-8B-instruct-Q4_K_M.gguf",
+            "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+            "Qwen2.5-3B-Instruct-Q5_K_M.gguf",
+            "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+        ]
+        for name in preferred_models:
+            candidate = os.path.join(models_dir, name)
+            if os.path.exists(candidate):
+                model_path = candidate
+                model_name = name
+                break
+
     if model_path is None and os.path.exists(models_dir):
         for f in os.listdir(models_dir):
             if f.endswith(".gguf"):
                 model_path = os.path.join(models_dir, f)
+                model_name = f
                 break
 
     server_url = os.getenv("LLM_BASE_URL", "http://127.0.0.1:8080")
-    return LLMClient(base_url=server_url, gguf_path=model_path)
+    return LLMClient(base_url=server_url, gguf_path=model_path, model_name=model_name)
+
+
+class GeminiClient:
+    """Клиент для взаимодействия с Google Gemini API через REST (requests).
+    Полностью совместим с интерфейсом LLMClient:
+    вызов client(prompt, max_tokens, temperature) возвращает {'choices': [{'text': ...}]}
+    """
+
+    def __init__(self, api_key: str | None = None, model: str = "gemini-2.5-flash", base_url: str | None = None):
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        self.base_url = (base_url or os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com")).rstrip("/")
+
+    def __call__(self, prompt: str, max_tokens: int = 2048, temperature: float = 0.1, repeat_penalty: float = 1.1) -> dict:
+        key = (self.api_key or os.getenv("GEMINI_API_KEY", "")).strip()
+        if not key:
+            return {
+                "choices": [{
+                    "text": (
+                        "⚠️ **API-ключ Google Gemini не указан.**\n\n"
+                        "Пожалуйста, введите ваш API-ключ в боковой панели Streamlit "
+                        "или сохраните его в файле `.env` в корне проекта (`GEMINI_API_KEY=AIzaSy...`)."
+                    )
+                }]
+            }
+
+        url = f"{self.base_url}/v1beta/models/{self.model}:generateContent?key={key}"
+        payload = {
+            "contents": [
+                {
+                    "parts": [{"text": prompt}]
+                }
+            ],
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+            }
+        }
+
+        proxies = {}
+        proxy = os.getenv("GEMINI_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+        if proxy:
+            proxies = {"http": proxy, "https": proxy}
+
+        try:
+            resp = requests.post(url, json=payload, timeout=60, proxies=proxies if proxies else None)
+            if resp.status_code == 200:
+                data = resp.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    text = "".join(p.get("text", "") for p in parts)
+                    return {"choices": [{"text": text}]}
+                return {"choices": [{"text": "Модель Gemini вернула пустой ответ."}]}
+
+            err_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            err_msg = err_data.get("error", {}).get("message", resp.text)
+            print(f"[GeminiClient] HTTP {resp.status_code}: {err_msg}")
+
+            if "API_KEY_INVALID" in err_msg or (resp.status_code == 400 and "API key" in err_msg):
+                msg = f"❌ **Недействительный ключ Gemini API:** {err_msg}\n\nПроверьте правильность ключа в Google AI Studio."
+            elif "User location is not supported" in err_msg:
+                msg = (
+                    "⚠️ **Геолокация не поддерживается Google Gemini без VPN/прокси.**\n\n"
+                    "Прямой доступ к API Google ограничен из вашего текущего региона.\n\n"
+                    "**Как решить:**\n"
+                    "1. Включите VPN в системе;\n"
+                    "2. Либо укажите локальный прокси в файле `.env` (`GEMINI_PROXY=http://127.0.0.1:10808`);\n"
+                    "3. Либо переключитесь на `Локальный Qwen (llama-server)` в боковой панели."
+                )
+            elif resp.status_code == 429:
+                msg = "⚠️ **Превышена квота запросов (Rate Limit) к Gemini API.** Подождите минуту и повторите запрос."
+            elif resp.status_code == 404:
+                msg = f"❌ **Модель `{self.model}` не найдена.** Попробуйте выбрать `gemini-1.5-flash` в настройках боковой панели."
+            else:
+                msg = f"❌ **Ошибка Gemini API (HTTP {resp.status_code}):** {err_msg}"
+
+            return {"choices": [{"text": msg}]}
+
+        except requests.exceptions.Timeout:
+            return {"choices": [{"text": "⏱️ **Таймаут соединения с Gemini API (60 секунд).** Проверьте интернет-соединение или VPN."}]}
+        except requests.exceptions.RequestException as e:
+            return {"choices": [{"text": f"🌐 **Сетевая ошибка при обращении к Gemini API:** {e}\n\nЕсли вы находитесь в регионе с ограничениями, может потребоваться VPN или прокси."}]}
+
+
+@st.cache_resource
+def load_gemini_llm(api_key: str | None = None, model: str = "gemini-2.5-flash") -> GeminiClient:
+    """Создаёт и кэширует экземпляр GeminiClient для работы с Google Gemini API."""
+    return GeminiClient(api_key=api_key, model=model)
+
 
 
 @st.cache_resource
@@ -168,16 +350,41 @@ GENERAL - остальное
 Ответ:
 """
 
-_SYSTEM_PROMPT = """Ты аналитик университета. Отвечай ТОЛЬКО на основе предоставленного контекста.
+_INTENT_INSTRUCTIONS = {
+    "SEARCH": (
+        "- Найди точное значение в переданном контексте.\n"
+        "- Обязательно сопоставляй точный столбец (год, форму обучения, категорию) с нужной строкой.\n"
+        "- Укажи таблицу или раздел и точное значение."
+    ),
+    "CALCULATE": (
+        "- Для вычислений: сначала выпиши точные исходные числа из таблицы/текста с указанием строки и столбца.\n"
+        "- Покажи пошаговый расчет с формулой (например: 274.0 + 308.0 = 582.0).\n"
+        "- Дай четкий итоговый результат."
+    ),
+    "ANOMALIES": (
+        "- Внимательно проверь таблицы на предмет математических ошибок и нестыковок.\n"
+        "- Пересчитай суммы по строкам и столбцам: сложи отдельные слагаемые и сравни их фактическую сумму со значением в строке 'Итого' / 'Всего'.\n"
+        "- Если сумма слагаемых не сходится со значением в 'Итого' / 'Всего', обязательно укажи: в какой таблице ошибка, какие числа складывались, сколько должно получиться на самом деле и какое ошибочное число впечатано в отчет."
+    ),
+    "ANALYZE": (
+        "- Проведи сравнительный анализ показателей, выдели ключевые изменения и тенденции.\n"
+        "- Приведи динамику изменений как в абсолютных значениях, так и в процентах (прирост/спад)."
+    ),
+    "STRUCTURE": (
+        "- Приведи структурированный перечень всех разделов и таблиц, найденных в контексте документа."
+    ),
+    "GENERAL": (
+        "- Ответь четко и по существу на основе информации из переданного контекста."
+    ),
+}
+
+_SYSTEM_PROMPT = """Ты аналитик университетской отчетности. Твоя задача — дать точный, логически обоснованный и проверяемый ответ по предоставленному контексту.
 
 Строгие правила:
-- Используй исключительно информацию из раздела «Контекст» ниже.
-- Если ответ на вопрос не содержится в контексте — прямо сообщи об этом.
-- Не добавляй факты, данные или рассуждения из общих знаний.
-- Не придумывай цифры, названия и даты.
-- Когда готов дать финальный ответ, напиши маркер ###ОТВЕТ### и после него — сам ответ.
-
-Тип запроса: {intent}
+1. Используй ИСКЛЮЧИТЕЛЬНО информацию из раздела «Контекст» ниже.
+2. Не добавляй факты, догадки или цифры от себя. Если данных в контексте недостаточно — прямо сообщи об этом.
+3. Соблюдай специальные требования для текущей задачи ({intent}):
+{intent_instruction}
 
 Контекст:
 {context}
@@ -185,7 +392,7 @@ _SYSTEM_PROMPT = """Ты аналитик университета. Отвеча
 Вопрос:
 {query}
 
-###ОТВЕТ###"""
+Ответ аналитика:"""
 
 
 def rerank_results(query, results, top_k=100):
@@ -214,6 +421,10 @@ def is_table_query(query):
         "сколько", "численность", "количество", "обучающихся",
         "магистрат", "магистр", "бакалавр", "аспирант",
         "стипенд", "доля", "процент", "всего",
+        "таблиц", "сумм", "затрат", "расход", "рубл", "млн",
+        "бюджет", "выплат", "фонд", "ппс", "профессор", "доцент",
+        "кадр", "преподавател", "факультет", "фпми", "автф", "фэн",
+        "рэф", "фла", "ошибк", "расхожден", "аномал", "динамик", "прирост"
     ]
     return any(k in query.lower() for k in keywords)
 
@@ -294,9 +505,9 @@ def build_structure_context(report_name, chunks):
 
 def faiss_results_to_context(report_name, results):
     """Формирует единую строку контекста из списка найденных чанков.
-    Ограничивает суммарный объём контекста 60 000 символами, чтобы не превысить
-    контекстное окно модели."""
-    MAX_CONTEXT_CHARS = 60_000
+    Ограничивает суммарный объём контекста 12 000 символами (~2500 токенов),
+    чтобы не перегружать контекстное окно и KV-кэш модели."""
+    MAX_CONTEXT_CHARS = 12_000
     parts = []
     total_size = 0
 
@@ -355,16 +566,26 @@ def _collect_context_for_report(report_id, user_query, intent, cursor):
     retriever = load_retriever()
 
     # ── Поиск по номеру раздела ───────────────────────────────────────────────
-    section_match = re.search(r"(\d+(?:\.\d+)*)", user_query)
-    if section_match:
-        section = section_match.group(1)
-        print("\nSECTION INFO:\n")
+    # Ищем явное указание на раздел/пункт (например: «в разделе 3.1», «пункт 2», «раздел 1.1»)
+    # или формат «X.Y» (например, «2.2»), исключая 4-значные года (2024, 2025)
+    section_pattern = re.compile(
+        r"(?:раздел[а-я]*|пункт[а-я]*|п\.)\s*(\d+(?:\.\d+)*)|\b([1-9]\d{0,1}\.\d+(?:\.\d+)*)\b",
+        re.IGNORECASE
+    )
+    section_match = section_pattern.search(user_query)
+    is_explicit_section_query = (
+        section_match is not None and any(w in user_query.lower() for w in ("раздел", "пункт", "п."))
+    )
+
+    results = []
+    if is_explicit_section_query and section_match:
+        section = section_match.group(1) or section_match.group(2)
+        print(f"\nSECTION SEARCH: {section}\n")
 
         raw_results = retriever.search_by_section(section, report_ids=[report_id])
         filtered = []
         for r in raw_results:
             fragment = extract_section_fragment(r["chunk_text"], section)
-            print(f"\nSECTION FRAGMENT:\n{fragment[:3000]}\n")
             filtered.append({
                 "score": r["score"],
                 "report_id": r["report_id"],
@@ -374,8 +595,8 @@ def _collect_context_for_report(report_id, user_query, intent, cursor):
 
         results = _deduplicate(filtered, key_fn=lambda r: r["chunk_text"][:1000])
 
-    # ── Семантический поиск ───────────────────────────────────────────────────
-    else:
+    # ── Семантический и табличный поиск ───────────────────────────────────────
+    if not results:
         table_results = []
         if is_table_query(user_query):
             table_retriever = load_table_retriever()
@@ -410,7 +631,9 @@ def _collect_context_for_report(report_id, user_query, intent, cursor):
             results,
             key_fn=lambda r: str(r["chunk_order"]) + r["chunk_text"][:500],
         )
-        results = rerank_results(user_query, results, top_k=100)
+        # Отбираем наиболее релевантные чанки (топ-3 для точечных, топ-5 для общих)
+        top_k_rerank = 5 if intent in ("ANALYZE", "ANOMALIES", "STRUCTURE") else 3
+        results = rerank_results(user_query, results, top_k=top_k_rerank)
 
         print("\nRERANK RESULTS")
         for r in results:
@@ -461,8 +684,10 @@ def get_analysis_from_qwen(llm, report_ids, user_query):
     if not full_context.strip():
         return "По выбранным документам релевантная информация не найдена."
 
+    intent_instruction = _INTENT_INSTRUCTIONS.get(intent, _INTENT_INSTRUCTIONS["GENERAL"])
     prompt = _SYSTEM_PROMPT.format(
         intent=intent,
+        intent_instruction=intent_instruction,
         context=full_context,
         query=user_query,
     )
@@ -482,9 +707,16 @@ def get_analysis_from_qwen(llm, report_ids, user_query):
     # Убираем блоки <think>...</think>
     raw_answer = re.sub(r"<think>.*?</think>", "", raw_answer, flags=re.DOTALL)
 
-    # Если модель повторила маркер внутри ответа — берём текст после последнего вхождения
-    marker = "###ОТВЕТ###"
-    if marker in raw_answer:
-        raw_answer = raw_answer.split(marker)[-1]
+    # Убираем маркер ###ОТВЕТ### (с любыми пробелами, двоеточиями и регистрами)
+    parts = re.split(r"###\s*ОТВЕТ\s*[:#]*", raw_answer, flags=re.IGNORECASE)
+    if len(parts) > 1:
+        raw_answer = parts[-1]
+
+    # Подчищаем остаточные маркеры
+    raw_answer = re.sub(r"###\s*[ОO][ТT]?[ВB]?[ЕE]?[ТT]?\s*[:#]*", "", raw_answer, flags=re.IGNORECASE)
 
     return raw_answer.strip()
+
+
+# Универсальный алиас для вызова анализа
+get_analysis = get_analysis_from_qwen

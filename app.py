@@ -1,12 +1,25 @@
+import os
 import streamlit as st
 import sqlite3
 import pandas as pd
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from docling_parser import process_document
-from analyzer import get_analysis_from_qwen, load_llm
+from analyzer import (
+    get_analysis_from_qwen,
+    load_llm,
+    load_gemini_llm,
+    get_available_local_models,
+    set_env_local_model,
+)
 
 st.set_page_config(page_title="Система анализа документов", layout="wide")
 
-llm = load_llm()
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -108,6 +121,119 @@ with st.sidebar:
         st.info("База данных пуста. Загрузите первый документ.")
 
     st.divider()
+    st.header("🧠 Языковая модель")
+
+    env_gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    provider_options = ["Облачные модели", "Локальные модели"]
+    has_key = bool(env_gemini_key or st.session_state.get("gemini_api_key"))
+    default_provider_idx = 0 if has_key else 1
+
+    selected_provider = st.radio(
+        "Выберите режим работы:",
+        provider_options,
+        index=default_provider_idx,
+        help="«Облачные модели» работают через интернет без нагрузки на ваш ПК. «Локальные модели» работают автономно на вашей видеокарте и процессоре.",
+    )
+
+    if selected_provider == "Облачные модели":
+        cloud_service = st.selectbox(
+            "Сервис:",
+            ["Google Gemini API"],
+            index=0,
+        )
+
+        gemini_key = st.text_input(
+            "Gemini API-ключ:",
+            value=st.session_state.get("gemini_api_key", env_gemini_key),
+            type="password",
+            placeholder="Вставьте ваш API-ключ...",
+            help="Получите бесплатный ключ в Google AI Studio: https://aistudio.google.com/app/apikey. Ключ сохраняется в сессии или считывается из .env.",
+        )
+        if gemini_key:
+            st.session_state.gemini_api_key = gemini_key
+
+        models_list = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
+        env_model = os.getenv("GEMINI_MODEL", "").strip()
+        if env_model and env_model not in models_list:
+            models_list.append(env_model)
+
+        model_name = st.selectbox(
+            "Модель:",
+            models_list,
+            index=0,
+            help="gemini-2.5-flash — самая современная и быстрая модель. gemini-1.5-flash — стабильный легковесный вариант.",
+        )
+        llm = load_gemini_llm(api_key=gemini_key, model=model_name)
+        active_model_badge = f"⚡ Gemini ({model_name})"
+
+        if gemini_key:
+            st.caption("✅ Ключ указан и активен")
+        else:
+            st.warning("⚠️ Введите API-ключ для отправки запросов")
+    else:
+        local_models = get_available_local_models()
+        if local_models:
+            env_local_raw = os.getenv("LOCAL_MODEL", "")
+            env_local = os.path.basename(env_local_raw.replace("\\", "/")) if env_local_raw else ""
+            default_idx = 0
+            if env_local in local_models:
+                default_idx = local_models.index(env_local)
+            elif st.session_state.get("local_model_name") in local_models:
+                default_idx = local_models.index(st.session_state["local_model_name"])
+
+            def format_model_label(filename: str) -> str:
+                fn = filename.lower()
+                if "yandex" in fn:
+                    return f"🇷🇺 YandexGPT 5 Lite 8B"
+                elif "qwen2.5-7b" in fn:
+                    return f"🇨🇳 Qwen 2.5 7B"
+                elif "qwen2.5-3b-instruct-q5" in fn:
+                    return f"⚡ Qwen 2.5 3B (Q5)"
+                elif "qwen2.5-3b" in fn:
+                    return f"⚡ Qwen 2.5 3B (Q4)"
+                return filename
+
+            selected_local_model = st.selectbox(
+                "Локальная модель:",
+                local_models,
+                index=default_idx,
+                format_func=format_model_label,
+                help="Файлы моделей в папке models/. При смене модели настройка сохраняется для run_llama_server.bat.",
+            )
+
+            # Сохраняем выбор в session_state и .env
+            if selected_local_model != st.session_state.get("local_model_name"):
+                st.session_state.local_model_name = selected_local_model
+                try:
+                    set_env_local_model(selected_local_model)
+                except Exception:
+                    pass
+
+            llm = load_llm(model_name=selected_local_model)
+            model_short = format_model_label(selected_local_model)
+            active_model_badge = f"🖥️ {model_short}"
+
+            # Проверка реального статуса сервера llama-server
+            server_info = llm.get_server_info()
+            if server_info["online"]:
+                running_model = server_info.get("model", "")
+                if running_model and running_model.lower() == selected_local_model.lower():
+                    st.success(f"🟢 Сервер онлайн: запущен `{model_short}`")
+                elif running_model:
+                    st.warning(
+                        f"⚠️ На сервере сейчас запущен **{format_model_label(running_model)}**.\n\n"
+                        f"Чтобы сервер переключился на **{model_short}**, перезапустите `run_llama_server.bat`."
+                    )
+                else:
+                    st.success(f"🟢 Сервер онлайн: порт 8080")
+            else:
+                st.info("ℹ️ Сервер `llama-server` не запущен. Запустите `run_llama_server.bat`")
+        else:
+            llm = load_llm()
+            active_model_badge = "🖥️ Локальная модель"
+            st.warning("⚠️ В папке `models/` не найдено файлов `.gguf`.")
+
+    st.divider()
     with st.expander("💡 Типы запросов"):
         st.markdown("""
 | Тип | Пример запроса |
@@ -123,6 +249,7 @@ with st.sidebar:
 # ── Главная область: чат ──────────────────────────────────────────────────────
 
 st.title("📊 Система анализа документов")
+st.caption(f"Активная модель: **{active_model_badge}**")
 
 if not active_ids:
     st.warning("👈 Выберите один или несколько документов в боковой панели.")
@@ -156,7 +283,7 @@ if user_query:
         st.markdown(user_query)
 
     with st.chat_message("assistant"):
-        with st.spinner("Модель анализирует документы…"):
+        with st.spinner(f"Модель ({active_model_badge}) анализирует документы…"):
             answer = get_analysis_from_qwen(llm, active_ids, user_query)
         st.markdown(answer)
 

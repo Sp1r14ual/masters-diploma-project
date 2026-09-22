@@ -5,7 +5,7 @@ echo ========================================================
 
 set LLAMA_BIN=C:\Users\Sp1r14ual\.docker\bin\inference\llama-server.exe
 set MODEL_PATH=models\Qwen2.5-3B-Instruct-Q5_K_M.gguf
-set NGL=99
+set NGL=18
 set PORT=8080
 
 if not exist "%LLAMA_BIN%" (

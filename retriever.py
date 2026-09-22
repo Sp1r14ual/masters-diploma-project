@@ -12,7 +12,7 @@ def extract_section_fragment(text: str, section_number: str) -> str:
     Ищет вхождение section_number, затем обрезает текст до начала следующего раздела.
     Если раздел не найден, возвращает первые 5000 символов. Максимум — 12 000 символов."""
     pattern = re.compile(
-        rf"{re.escape(section_number)}[\s\.]", re.IGNORECASE
+        rf"(?:#+\s*|\bраздел\s+)?{re.escape(section_number)}[\s\.]", re.IGNORECASE
     )
     match = pattern.search(text)
     if not match:
@@ -20,9 +20,10 @@ def extract_section_fragment(text: str, section_number: str) -> str:
 
     fragment = text[match.start():]
 
-    next_section = re.search(r"\n(?:#+\s*)?\d+(?:\.\d+)*", fragment[50:])
+    # Ищем начало следующего раздела (заголовок с решётками или слово «Раздел»)
+    next_section = re.search(r"\n(?:#{1,6}\s*|\bРаздел\s+)\d+(?:\.\d+)*", fragment[30:], re.IGNORECASE)
     if next_section:
-        fragment = fragment[: next_section.start()]
+        fragment = fragment[: 30 + next_section.start()]
 
     return fragment[:12000]
 

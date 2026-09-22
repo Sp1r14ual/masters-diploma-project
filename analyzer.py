@@ -118,8 +118,8 @@ def load_llm() -> LLMClient:
     # Автоматический поиск подходящей модели
     preferred_models = [
         "Qwen2.5-3B-Instruct-Q5_K_M.gguf",
-        "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
-        "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+        # "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+        # "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
     ]
     model_path = None
     for name in preferred_models:
@@ -214,6 +214,10 @@ def is_table_query(query):
         "сколько", "численность", "количество", "обучающихся",
         "магистрат", "магистр", "бакалавр", "аспирант",
         "стипенд", "доля", "процент", "всего",
+        "таблиц", "сумм", "затрат", "расход", "рубл", "млн",
+        "бюджет", "выплат", "фонд", "ппс", "профессор", "доцент",
+        "кадр", "преподавател", "факультет", "фпми", "автф", "фэн",
+        "рэф", "фла", "ошибк", "расхожден", "аномал", "динамик", "прирост"
     ]
     return any(k in query.lower() for k in keywords)
 
@@ -355,16 +359,26 @@ def _collect_context_for_report(report_id, user_query, intent, cursor):
     retriever = load_retriever()
 
     # ── Поиск по номеру раздела ───────────────────────────────────────────────
-    section_match = re.search(r"(\d+(?:\.\d+)*)", user_query)
-    if section_match:
-        section = section_match.group(1)
-        print("\nSECTION INFO:\n")
+    # Ищем явное указание на раздел/пункт (например: «в разделе 3.1», «пункт 2», «раздел 1.1»)
+    # или формат «X.Y» (например, «2.2»), исключая 4-значные года (2024, 2025)
+    section_pattern = re.compile(
+        r"(?:раздел[а-я]*|пункт[а-я]*|п\.)\s*(\d+(?:\.\d+)*)|\b([1-9]\d{0,1}\.\d+(?:\.\d+)*)\b",
+        re.IGNORECASE
+    )
+    section_match = section_pattern.search(user_query)
+    is_explicit_section_query = (
+        section_match is not None and any(w in user_query.lower() for w in ("раздел", "пункт", "п."))
+    )
+
+    results = []
+    if is_explicit_section_query and section_match:
+        section = section_match.group(1) or section_match.group(2)
+        print(f"\nSECTION SEARCH: {section}\n")
 
         raw_results = retriever.search_by_section(section, report_ids=[report_id])
         filtered = []
         for r in raw_results:
             fragment = extract_section_fragment(r["chunk_text"], section)
-            print(f"\nSECTION FRAGMENT:\n{fragment[:3000]}\n")
             filtered.append({
                 "score": r["score"],
                 "report_id": r["report_id"],
@@ -374,8 +388,8 @@ def _collect_context_for_report(report_id, user_query, intent, cursor):
 
         results = _deduplicate(filtered, key_fn=lambda r: r["chunk_text"][:1000])
 
-    # ── Семантический поиск ───────────────────────────────────────────────────
-    else:
+    # ── Семантический и табличный поиск ───────────────────────────────────────
+    if not results:
         table_results = []
         if is_table_query(user_query):
             table_retriever = load_table_retriever()
@@ -482,9 +496,12 @@ def get_analysis_from_qwen(llm, report_ids, user_query):
     # Убираем блоки <think>...</think>
     raw_answer = re.sub(r"<think>.*?</think>", "", raw_answer, flags=re.DOTALL)
 
-    # Если модель повторила маркер внутри ответа — берём текст после последнего вхождения
-    marker = "###ОТВЕТ###"
-    if marker in raw_answer:
-        raw_answer = raw_answer.split(marker)[-1]
+    # Убираем маркер ###ОТВЕТ### (с любыми пробелами, двоеточиями и регистрами)
+    parts = re.split(r"###\s*ОТВЕТ\s*[:#]*", raw_answer, flags=re.IGNORECASE)
+    if len(parts) > 1:
+        raw_answer = parts[-1]
+
+    # Подчищаем остаточные маркеры
+    raw_answer = re.sub(r"###\s*[ОO][ТT]?[ВB]?[ЕE]?[ТT]?\s*[:#]*", "", raw_answer, flags=re.IGNORECASE)
 
     return raw_answer.strip()

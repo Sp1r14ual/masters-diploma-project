@@ -23,9 +23,10 @@ class LLMClient:
     3) Локальный llama-cpp-python (если библиотека установлена)
     4) Безопасная заглушка (если сервер ещё не запущен, чтобы интерфейс не падал)."""
 
-    def __init__(self, base_url: str = "http://127.0.0.1:8080", gguf_path: str | None = None):
+    def __init__(self, base_url: str = "http://127.0.0.1:8080", gguf_path: str | None = None, model_name: str | None = None):
         self.base_url = os.getenv("LLM_BASE_URL", base_url).rstrip("/")
         self.gguf_path = gguf_path
+        self.model_name = model_name or (os.path.basename(gguf_path) if gguf_path else "Локальная модель")
         self._llama_instance = None
 
         if self.gguf_path and os.path.exists(self.gguf_path):
@@ -33,7 +34,7 @@ class LLMClient:
                 from llama_cpp import Llama
                 self._llama_instance = Llama(
                     model_path=self.gguf_path,
-                    n_gpu_layers=int(os.getenv("LLM_GPU_LAYERS", "10")),
+                    n_gpu_layers=int(os.getenv("LLM_GPU_LAYERS", "18")),
                     n_ctx=int(os.getenv("LLM_CTX", "8192")),
                     n_threads=int(os.getenv("LLM_THREADS", "6")),
                     n_batch=512,
@@ -42,6 +43,32 @@ class LLMClient:
                 )
             except Exception:
                 self._llama_instance = None
+
+    def get_server_info(self) -> dict:
+        """Проверяет доступность сервера llama-server и определяет имя запущенной модели."""
+        try:
+            resp = requests.get(f"{self.base_url}/props", timeout=1.5)
+            if resp.status_code == 200:
+                data = resp.json()
+                raw_path = data.get("model_path", "")
+                name = os.path.basename(raw_path.replace("\\", "/")) if raw_path else "Online"
+                return {"online": True, "model": name}
+        except Exception:
+            pass
+
+        try:
+            resp = requests.get(f"{self.base_url}/v1/models", timeout=1.5)
+            if resp.status_code == 200:
+                data = resp.json()
+                models_data = data.get("data", [])
+                if models_data:
+                    raw_id = models_data[0].get("id", "")
+                    name = os.path.basename(raw_id.replace("\\", "/")) if raw_id else "Online"
+                    return {"online": True, "model": name}
+        except Exception:
+            pass
+
+        return {"online": False, "model": None}
 
     def __call__(self, prompt: str, max_tokens: int = 2048, temperature: float = 0.1, repeat_penalty: float = 1.1) -> dict:
         # 1. Попытка через локальный инстанс llama_cpp, если он загружен
@@ -122,33 +149,85 @@ class LLMClient:
         }
 
 
-@st.cache_resource
-def load_llm() -> LLMClient:
-    """Загружает или подключает языковую модель Qwen и кэширует клиент на весь сеанс."""
+def get_available_local_models() -> list[str]:
+    """Возвращает список доступных .gguf моделей из папки models/,
+    отсортированных по приоритету."""
     base = os.path.dirname(os.path.abspath(__file__))
     models_dir = os.path.join(base, "models")
-    
-    # Автоматический поиск подходящей модели
-    preferred_models = [
+    if not os.path.exists(models_dir):
+        return []
+
+    priority = [
+        "YandexGPT-5-Lite-8B-instruct-Q4_K_M.gguf",
         "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
         "Qwen2.5-3B-Instruct-Q5_K_M.gguf",
         "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
     ]
+    files = [f for f in os.listdir(models_dir) if f.endswith(".gguf")]
+
+    def sort_key(name):
+        return (priority.index(name) if name in priority else 999, name)
+
+    files.sort(key=sort_key)
+    return files
+
+
+def set_env_local_model(model_filename: str):
+    """Сохраняет выбранную локальную модель в файл .env для скрипта запуска."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(base, ".env")
+    lines = []
+    found = False
+    new_line = f"LOCAL_MODEL=models\\{model_filename}\n"
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        for i, line in enumerate(lines):
+            if line.strip().startswith("LOCAL_MODEL="):
+                lines[i] = new_line
+                found = True
+                break
+    if not found:
+        lines.append(new_line)
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+@st.cache_resource
+def load_llm(model_name: str | None = None) -> LLMClient:
+    """Загружает или подключает локальную языковую модель (YandexGPT / Qwen) и кэширует клиент."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    models_dir = os.path.join(base, "models")
+
     model_path = None
-    for name in preferred_models:
-        candidate = os.path.join(models_dir, name)
+    if model_name:
+        candidate = os.path.join(models_dir, model_name)
         if os.path.exists(candidate):
             model_path = candidate
-            break
-            
+
+    if model_path is None:
+        preferred_models = [
+            "YandexGPT-5-Lite-8B-instruct-Q4_K_M.gguf",
+            "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+            "Qwen2.5-3B-Instruct-Q5_K_M.gguf",
+            "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+        ]
+        for name in preferred_models:
+            candidate = os.path.join(models_dir, name)
+            if os.path.exists(candidate):
+                model_path = candidate
+                model_name = name
+                break
+
     if model_path is None and os.path.exists(models_dir):
         for f in os.listdir(models_dir):
             if f.endswith(".gguf"):
                 model_path = os.path.join(models_dir, f)
+                model_name = f
                 break
 
     server_url = os.getenv("LLM_BASE_URL", "http://127.0.0.1:8080")
-    return LLMClient(base_url=server_url, gguf_path=model_path)
+    return LLMClient(base_url=server_url, gguf_path=model_path, model_name=model_name)
 
 
 class GeminiClient:

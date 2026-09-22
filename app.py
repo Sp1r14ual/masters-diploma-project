@@ -10,7 +10,13 @@ except ImportError:
     pass
 
 from docling_parser import process_document
-from analyzer import get_analysis_from_qwen, load_llm, load_gemini_llm
+from analyzer import (
+    get_analysis_from_qwen,
+    load_llm,
+    load_gemini_llm,
+    get_available_local_models,
+    set_env_local_model,
+)
 
 st.set_page_config(page_title="Система анализа документов", layout="wide")
 
@@ -165,9 +171,67 @@ with st.sidebar:
         else:
             st.warning("⚠️ Введите API-ключ для отправки запросов")
     else:
-        llm = load_llm()
-        active_model_badge = "🖥️ Локальный Qwen (llama-server)"
-        st.caption("Сервер: `http://127.0.0.1:8080` (Qwen2.5-7B / 3B)")
+        local_models = get_available_local_models()
+        if local_models:
+            env_local_raw = os.getenv("LOCAL_MODEL", "")
+            env_local = os.path.basename(env_local_raw.replace("\\", "/")) if env_local_raw else ""
+            default_idx = 0
+            if env_local in local_models:
+                default_idx = local_models.index(env_local)
+            elif st.session_state.get("local_model_name") in local_models:
+                default_idx = local_models.index(st.session_state["local_model_name"])
+
+            def format_model_label(filename: str) -> str:
+                fn = filename.lower()
+                if "yandex" in fn:
+                    return f"🇷🇺 YandexGPT 5 Lite 8B"
+                elif "qwen2.5-7b" in fn:
+                    return f"🇨🇳 Qwen 2.5 7B"
+                elif "qwen2.5-3b-instruct-q5" in fn:
+                    return f"⚡ Qwen 2.5 3B (Q5)"
+                elif "qwen2.5-3b" in fn:
+                    return f"⚡ Qwen 2.5 3B (Q4)"
+                return filename
+
+            selected_local_model = st.selectbox(
+                "Локальная модель:",
+                local_models,
+                index=default_idx,
+                format_func=format_model_label,
+                help="Файлы моделей в папке models/. При смене модели настройка сохраняется для run_llama_server.bat.",
+            )
+
+            # Сохраняем выбор в session_state и .env
+            if selected_local_model != st.session_state.get("local_model_name"):
+                st.session_state.local_model_name = selected_local_model
+                try:
+                    set_env_local_model(selected_local_model)
+                except Exception:
+                    pass
+
+            llm = load_llm(model_name=selected_local_model)
+            model_short = format_model_label(selected_local_model)
+            active_model_badge = f"🖥️ {model_short}"
+
+            # Проверка реального статуса сервера llama-server
+            server_info = llm.get_server_info()
+            if server_info["online"]:
+                running_model = server_info.get("model", "")
+                if running_model and running_model.lower() == selected_local_model.lower():
+                    st.success(f"🟢 Сервер онлайн: запущен `{model_short}`")
+                elif running_model:
+                    st.warning(
+                        f"⚠️ На сервере сейчас запущен **{format_model_label(running_model)}**.\n\n"
+                        f"Чтобы сервер переключился на **{model_short}**, перезапустите `run_llama_server.bat`."
+                    )
+                else:
+                    st.success(f"🟢 Сервер онлайн: порт 8080")
+            else:
+                st.info("ℹ️ Сервер `llama-server` не запущен. Запустите `run_llama_server.bat`")
+        else:
+            llm = load_llm()
+            active_model_badge = "🖥️ Локальная модель"
+            st.warning("⚠️ В папке `models/` не найдено файлов `.gguf`.")
 
     st.divider()
     with st.expander("💡 Типы запросов"):
